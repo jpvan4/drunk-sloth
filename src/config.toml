@@ -1,0 +1,7 @@
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[alias]
+gpu-test = "test --features gpu -- --nocapture"
+hp-test = "test --features high-precision -- --nocapture"
+full-test = "test --all-features -- --nocapture"
