@@ -3,9 +3,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::time::Instant;
-use std::fmt;
-#[cfg(feature = "gpu")]
-use lattice_solver::GPUManager;
+
 use lattice_solver::{
     Lattice, LLLReducer, LLLParams, BKZReducer, BKZParams,
     SVPSolver, SVPSolverParams, SVPAlgorithm,
@@ -13,48 +11,14 @@ use lattice_solver::{
     core::types::{QualityMetrics, BenchmarkResult, LatticeVector, PrecisionType},
     utils::*,
 };
-#[cfg(feature = "gpu")]
-use lattice_solver::gpu::GPUAcceleratedOperations;
+use lattice_solver::gpu::GPUAcceleratedOperations; // Uncomment if GPUAcceleratedOperations is in gpu module
 use lattice_solver::features;
 
-// Custom error type for better error handling
-#[derive(Debug)]
-enum LatticeSolverError {
-    GpuInitializationFailed(String),
-    LatticeOperationFailed(String),
-    DimensionMismatch { expected: usize, actual: usize },
-    FileOperationFailed(String),
-    BenchmarkFailed(String),
-}
-
-impl fmt::Display for LatticeSolverError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            LatticeSolverError::GpuInitializationFailed(msg) => {
-                write!(f, "GPU initialization failed: {}", msg)
-            }
-            LatticeSolverError::LatticeOperationFailed(msg) => {
-                write!(f, "Lattice operation failed: {}", msg)
-            }
-            LatticeSolverError::DimensionMismatch { expected, actual } => {
-                write!(f, "Dimension mismatch: expected {}, got {}", expected, actual)
-            }
-            LatticeSolverError::FileOperationFailed(msg) => {
-                write!(f, "File operation failed: {}", msg)
-            }
-            LatticeSolverError::BenchmarkFailed(msg) => {
-                write!(f, "Benchmark failed: {}", msg)
-            }
-        }
-    }
-}
-
-impl std::error::Error for LatticeSolverError {}
 
 /// Lattice reduction algorithms CLI
 #[derive(Parser, Debug)]
 #[clap(name = "lattice_solver")]
-#[clap(about = "lattice reduction crate with LLL, BKZ, SVP, and CVP solvers")]
+#[clap(about = "Production-ready lattice reduction crate with LLL, BKZ, SVP, and CVP solvers")]
 #[clap(version = "1.0.0")]
 struct Args {
     /// Input file containing lattice basis (fplll format)
@@ -303,7 +267,6 @@ impl From<CVPAlgorithmCli> for CVPAlgorithm {
         }
     }
 }
-
 // Add missing utility functions
 fn generate_random_lattice_cli(
     rows: usize,
@@ -312,117 +275,6 @@ fn generate_random_lattice_cli(
 ) -> Result<Lattice, Box<dyn std::error::Error>> {
     lattice_solver::utils::generate_random_lattice(rows, cols, seed).map_err(|e| e.into())
 }
-
-// Helper function to convert preprocessing algorithm
-fn convert_preprocessing_algorithm(algo: PreprocessingAlgorithm) -> lattice_solver::cvp::PreprocessingAlgorithm {
-    match algo {
-        PreprocessingAlgorithm::None => lattice_solver::cvp::PreprocessingAlgorithm::None,
-        PreprocessingAlgorithm::LLL => lattice_solver::cvp::PreprocessingAlgorithm::LLL,
-        PreprocessingAlgorithm::BKZ => lattice_solver::cvp::PreprocessingAlgorithm::BKZ,
-        PreprocessingAlgorithm::DeepLLL => lattice_solver::cvp::PreprocessingAlgorithm::DeepLLL,
-        PreprocessingAlgorithm::Combined => lattice_solver::cvp::PreprocessingAlgorithm::Combined,
-    }
-}
-
-// Helper function to handle GPU/CPU execution with fallback
-async fn execute_with_gpu_fallback<T, F>(
-    use_gpu: bool,
-    gpu_available: bool,
-    gpu_operation: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>>>>,
-    cpu_operation: F,
-    operation_name: &str,
-) -> Result<T, Box<dyn std::error::Error>>
-where
-    F: FnOnce() -> Result<T, Box<dyn std::error::Error>>,
-{
-    if use_gpu && gpu_available && gpu_operation.is_some() {
-        log::info!("Using GPU-accelerated {}", operation_name);
-        match gpu_operation.unwrap().await {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                log::warn!("Failed to initialize GPU for {}: {}. Falling back to CPU.", operation_name, e);
-                cpu_operation()
-            }
-        }
-    } else {
-        log::info!("Using CPU-only {}", operation_name);
-        cpu_operation()
-    }
-}
-
-// Helper function to create or validate target vector
-fn create_or_validate_target_vector(
-    lattice: &Lattice,
-    target: Option<Vec<f64>>,
-) -> Result<LatticeVector, Box<dyn std::error::Error>> {
-    match target {
-        Some(v) => {
-            if v.len() != lattice.ambient_dimension() {
-                return Err(format!("Target vector dimension {} doesn't match lattice dimension {}", 
-                                 v.len(), lattice.ambient_dimension()).into());
-            }
-            Ok(LatticeVector::new(v))
-        }
-        None => {
-            // Generate random target if not provided
-            let v: Vec<f64> = (0..lattice.ambient_dimension())
-                .map(|_| rand::random::<f64>() * 10.0 - 5.0)
-                .collect();
-            Ok(LatticeVector::new(v))
-        }
-    }
-}
-
-// Helper function to run benchmark algorithm
-async fn run_benchmark_algorithm(
-    algo: BenchmarkAlgorithm,
-    test_lattice: &Lattice,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let result = match algo {
-        BenchmarkAlgorithm::LLL => {
-            let reducer = LLLReducer::new();
-            reducer.reduce(test_lattice)?;
-            "LLL".to_string()
-        }
-        BenchmarkAlgorithm::BKZ => {
-            let dim = test_lattice.dimension().0;
-            let reducer = BKZReducer::with_params(BKZParams::new(dim.min(20)));
-            reducer.reduce(test_lattice)?;
-            "BKZ".to_string()
-        }
-        BenchmarkAlgorithm::SVP => {
-            let solver = SVPSolver::new();
-            solver.solve(test_lattice)?;
-            "SVP".to_string()
-        }
-        BenchmarkAlgorithm::CVP => {
-            let solver = CVPSolver::new();
-            let dim = test_lattice.dimension().0;
-            let target = LatticeVector::zeros(dim);
-            solver.solve(test_lattice, &target)?;
-            "CVP".to_string()
-        }
-    };
-    Ok(result)
-}
-
-// Helper function to run GPU benchmark comparison
-#[cfg(feature = "gpu")]
-async fn run_gpu_benchmark_comparison(
-    gpu_ops: &dyn GPUAcceleratedOperations,
-    dimensions: &[usize],
-) -> Result<(), Box<dyn std::error::Error>> {
-    for &dim in dimensions {
-        let test_lattice = generate_random_lattice_cli(dim, dim, None)?;
-        let benchmark_result = gpu_ops
-            .benchmark_gpu_performance(test_lattice.basis());
-        let benchmark_result = benchmark_result.unwrap();
-        log::info!("GPU speedup: {:.2}x for {}x{} matrix", 
-                  benchmark_result.speedup, dim, dim);
-    }
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -451,9 +303,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
    // log::info!("Parallel processing: {}", config.parallel);
 
     // Initialize features
- //log::info!("GPU enabled: {}", features::gpu_available());
- //log::info!("High precision: {}", features::high_precision_enabled());
- //log::info!("Parallel processing: {}", features::parallel_enabled);
+  //log::info!("GPU enabled: {}", features::gpu_available());
+  //log::info!("High precision: {}", features::high_precision_enabled());
+  //log::info!("Parallel processing: {}", features::parallel_enabled());
     
     let command = args.command.clone();
 
@@ -485,6 +337,137 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Custom error type for better error handling
+#[derive(Debug, thiserror::Error)]
+enum LatticeSolverError {
+    #[error("GPU initialization failed: {0}")]
+    GpuInitializationFailed(String),
+    #[error("Lattice operation failed: {0}")]
+    LatticeOperationFailed(String),
+    #[error("Dimension mismatch: expected {expected}, got {actual}")]
+    DimensionMismatch { expected: usize, actual: usize },
+    #[error("File operation failed: {0}")]
+    FileOperationFailed(String),
+    #[error("Benchmark failed: {0}")]
+    BenchmarkFailed(String),
+}
+
+// Helper function to handle GPU/CPU execution with fallback
+async fn execute_with_gpu_fallback<T, F, G, R>(
+    use_gpu: bool,
+    gpu_available: bool,
+    gpu_operation: G,
+    cpu_operation: F,
+    operation_name: &str,
+) -> Result<T, LatticeSolverError>
+where
+    F: FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+    G: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    if use_gpu && gpu_available {
+        log::info!("Using GPU-accelerated {}", operation_name);
+        match gpu_operation.await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                log::warn!("Failed to initialize GPU for {}: {}. Falling back to CPU.", operation_name, e);
+                cpu_operation().map_err(|e| LatticeSolverError::LatticeOperationFailed(e.to_string()))
+            }
+        }
+    } else {
+        log::info!("Using CPU-only {}", operation_name);
+        cpu_operation().map_err(|e| LatticeSolverError::LatticeOperationFailed(e.to_string()))
+    }
+}
+
+// Helper function to create or validate target vector
+fn create_or_validate_target_vector(
+    lattice: &Lattice,
+    target: Option<Vec<f64>>,
+) -> Result<LatticeVector, LatticeSolverError> {
+    match target {
+        Some(v) => {
+            if v.len() != lattice.ambient_dimension() {
+                return Err(LatticeSolverError::DimensionMismatch {
+                    expected: lattice.ambient_dimension(),
+                    actual: v.len(),
+                });
+            }
+            Ok(LatticeVector::new(v))
+        }
+        None => {
+            // Generate random target if not provided
+            let v: Vec<f64> = (0..lattice.ambient_dimension())
+                .map(|_| rand::random::<f64>() * 10.0 - 5.0)
+                .collect();
+            Ok(LatticeVector::new(v))
+        }
+    }
+}
+
+// Helper function to convert preprocessing algorithm
+fn convert_preprocessing_algorithm(algo: PreprocessingAlgorithm) -> lattice_solver::cvp::PreprocessingAlgorithm {
+    match algo {
+        PreprocessingAlgorithm::None => lattice_solver::cvp::PreprocessingAlgorithm::None,
+        PreprocessingAlgorithm::LLL => lattice_solver::cvp::PreprocessingAlgorithm::LLL,
+        PreprocessingAlgorithm::BKZ => lattice_solver::cvp::PreprocessingAlgorithm::BKZ,
+        PreprocessingAlgorithm::DeepLLL => lattice_solver::cvp::PreprocessingAlgorithm::DeepLLL,
+        PreprocessingAlgorithm::Combined => lattice_solver::cvp::PreprocessingAlgorithm::Combined,
+    }
+}
+
+// Helper function to run benchmark algorithm
+async fn run_benchmark_algorithm(
+    algo: BenchmarkAlgorithm,
+    test_lattice: &Lattice,
+) -> Result<String, LatticeSolverError> {
+    let result = match algo {
+        BenchmarkAlgorithm::LLL => {
+            let reducer = LLLReducer::new();
+            reducer.reduce(test_lattice)?;
+            "LLL".to_string()
+        }
+        BenchmarkAlgorithm::BKZ => {
+            let dim = test_lattice.dimension().0;
+            let reducer = BKZReducer::with_params(BKZParams::new(dim.min(20)));
+            reducer.reduce(test_lattice)?;
+            "BKZ".to_string()
+        }
+        BenchmarkAlgorithm::SVP => {
+            let solver = SVPSolver::new();
+            solver.solve(test_lattice)?;
+            "SVP".to_string()
+        }
+        BenchmarkAlgorithm::CVP => {
+            let solver = CVPSolver::new();
+            let dim = test_lattice.dimension().0;
+            let target = LatticeVector::zeros(dim);
+            solver.solve(test_lattice, &target)?;
+            "CVP".to_string()
+        }
+    };
+    Ok(result)
+}
+
+// Helper function to run GPU benchmark comparison
+async fn run_gpu_benchmark_comparison(
+    gpu_ops: &GPUAcceleratedOperations,
+    dimensions: &[usize],
+) -> Result<(), LatticeSolverError> {
+    for &dim in dimensions {
+        let test_lattice = generate_random_lattice_cli(dim, dim, None)
+            .map_err(|e| LatticeSolverError::LatticeOperationFailed(e.to_string()))?;
+        
+        let benchmark_result = gpu_ops
+            .benchmark_gpu_performance(test_lattice.basis())
+            .await
+            .map_err(|e| LatticeSolverError::GpuInitializationFailed(e.to_string()))?;
+        
+        log::info!("GPU speedup: {:.2}x for {}x{} matrix",
+                  benchmark_result.speedup, dim, dim);
+    }
+    Ok(())
+}
+
 async fn run_lll_reduction(
     args: &Args,
     delta: f64,
@@ -498,31 +481,24 @@ async fn run_lll_reduction(
     let params = LLLParams::new(delta, eta);
     
     let start_time = Instant::now();
-    #[cfg(feature = "gpu")]
-    let lattice_clone = lattice.clone();
-    #[cfg(feature = "gpu")]
-    let gpu_operation = Some(Box::pin(async move {
-        let gpu_manager = GPUManager::new(None).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-        let gpu_ops: &dyn GPUAcceleratedOperations = &gpu_manager;
-        gpu_ops.accelerated_lll_reduction(&lattice_clone).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-    }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Lattice, Box<dyn std::error::Error>>>>>);
-    #[cfg(not(feature = "gpu"))]
-    let gpu_operation: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Lattice, Box<dyn std::error::Error>>>>>> = None;
-
-    let reduced_lattice: Lattice = execute_with_gpu_fallback(
+    let reduced_lattice = execute_with_gpu_fallback(
         args.gpu,
         features::gpu_available(),
-        gpu_operation,
+        async {
+            let gpu_ops = GPUAcceleratedOperations::new().await?;
+            gpu_ops.accelerated_lll_reduction(&lattice).await
+        },
         || {
             let reducer = LLLReducer::with_params(params.clone());
-            reducer.reduce(&lattice).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            reducer.reduce(&lattice)
         },
         "LLL reduction",
     ).await?;
     let execution_time = start_time.elapsed();
     
     // Compute quality metrics
-    let reduced_quality = reduced_lattice.quality_metrics().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let reduced_quality = reduced_lattice.quality_metrics()
+        .map_err(|e| LatticeSolverError::LatticeOperationFailed(e.to_string()))?;
     
     // Output results
     let result = LLLResult {
@@ -547,58 +523,51 @@ async fn run_bkz_reduction(
     progressive: bool,
     pruning: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Running BKZ reduction with beta={}, rounds={}, progressive={}, pruning={}", 
+    log::info!("Running BKZ reduction with beta={}, rounds={}, progressive={}, pruning={}",
                beta, max_rounds, progressive, pruning);
     
     let lattice = load_input_lattice(args)?;
     let original_lattice = lattice.clone();
     
-    let mut params: BKZParams = BKZParams::new(beta);
+    let mut params = BKZParams::new(beta);
     params.max_rounds = max_rounds;
     params.progressive = progressive;
     params.enable_pruning = pruning;
-
+    
     // Setup precision if requested
     if args.high_precision {
         params.lll_params.precision = PrecisionType::Arbitrary { bits: args.precision_bits };
     }
-
+    
     let start_time = Instant::now();
-    #[cfg(feature = "gpu")]
-    let lattice_clone = lattice.clone();
-    #[cfg(feature = "gpu")]
-    let gpu_operation = Some(Box::pin(async move {
-        let gpu_manager = GPUManager::new(None).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-        let gpu_ops: &dyn GPUAcceleratedOperations = &gpu_manager;
-        gpu_ops.accelerated_bkz_reduction(&lattice_clone).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-    }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Lattice, Box<dyn std::error::Error>>>>>);
-    #[cfg(not(feature = "gpu"))]
-    let gpu_operation: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Lattice, Box<dyn std::error::Error>>>>>> = None;
-
-    let reduced_lattice: Lattice = execute_with_gpu_fallback(
+    let reduced_lattice = execute_with_gpu_fallback(
         args.gpu,
         features::gpu_available(),
-        gpu_operation,
+        async {
+            let gpu_ops = GPUAcceleratedOperations::new().await?;
+            gpu_ops.accelerated_bkz_reduction(&lattice, &params).await
+        },
         || {
             let reducer = BKZReducer::with_params(params);
-            reducer.reduce(&lattice).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            reducer.reduce(&lattice)
         },
         "BKZ reduction",
     ).await?;
     let execution_time = start_time.elapsed();
-
-    let quality = reduced_lattice.quality_metrics().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-
+    
+    let quality = reduced_lattice.quality_metrics()
+        .map_err(|e| LatticeSolverError::LatticeOperationFailed(e.to_string()))?;
+    
     let result = BKZResult {
         original_lattice,
         reduced_lattice,
         execution_time,
         quality_improvement: quality,
         algorithm: "BKZ".to_string(),
-        parameters: format!("beta={}, rounds={}, progressive={}, pruning={}", 
+        parameters: format!("beta={}, rounds={}, progressive={}, pruning={}",
                            beta, max_rounds, progressive, pruning),
     };
-
+    
     save_result(args, &result)?;
     log::info!("BKZ reduction completed in {:?}", execution_time);
     Ok(())
@@ -610,7 +579,7 @@ async fn run_svp_solver(
     max_radius: f64,
     pruning: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Solving SVP with algorithm={:?}, max_radius={}, pruning={}", 
+    log::info!("Solving SVP with algorithm={:?}, max_radius={}, pruning={}",
                algorithm, max_radius, pruning);
     
     let lattice = load_input_lattice(args)?;
@@ -621,7 +590,8 @@ async fn run_svp_solver(
     
     let start_time = Instant::now();
     let solver = SVPSolver::with_params(params);
-    let result = solver.solve(&lattice)?;
+    let result = solver.solve(&lattice)
+        .map_err(|e| LatticeSolverError::LatticeOperationFailed(e.to_string()))?;
     let execution_time = start_time.elapsed();
     
     let svp_result = SVPResult {
@@ -646,7 +616,7 @@ async fn run_cvp_solver(
     preprocessing: bool,
     preprocessing_algo: PreprocessingAlgorithm,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Solving CVP with algorithm={:?}, preprocessing={}, preprocessing_algo={:?}", 
+    log::info!("Solving CVP with algorithm={:?}, preprocessing={}, preprocessing_algo={:?}",
                algorithm, preprocessing, preprocessing_algo);
     
     let lattice = load_input_lattice(args)?;
@@ -659,7 +629,8 @@ async fn run_cvp_solver(
     
     let start_time = Instant::now();
     let solver = CVPSolver::with_params(params);
-    let result = solver.solve(&lattice, &target_vector)?;
+    let result = solver.solve(&lattice, &target_vector)
+        .map_err(|e| LatticeSolverError::LatticeOperationFailed(e.to_string()))?;
     let execution_time = start_time.elapsed();
     
     let cvp_result = CVPResult {
@@ -685,7 +656,7 @@ async fn run_benchmark(
     runs: usize,
     compare_gpu: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Running benchmark: {:?}, dimensions: {:?}, runs: {}", 
+    log::info!("Running benchmark: {:?}, dimensions: {:?}, runs: {}",
                algorithms, dimensions, runs);
     
     let mut benchmark_results = Vec::new();
@@ -693,7 +664,8 @@ async fn run_benchmark(
     // Pre-allocate test lattices to reduce memory allocation overhead
     let mut test_lattices: Vec<Lattice> = Vec::with_capacity(dimensions.len());
     for &dim in &dimensions {
-        test_lattices.push(generate_random_lattice_cli(dim, dim, None)?);
+        test_lattices.push(generate_random_lattice_cli(dim, dim, None)
+            .map_err(|e| LatticeSolverError::BenchmarkFailed(e.to_string()))?);
     }
     
     for (i, &dim) in dimensions.iter().enumerate() {
@@ -716,7 +688,8 @@ async fn run_benchmark(
                     input_size: dim,
                     execution_time_ms: execution_time.as_secs_f64() * 1000.0,
                     peak_memory_bytes: 0, // Would need proper memory tracking
-                    quality_metrics: lattice_copy.quality_metrics()?,
+                    quality_metrics: lattice_copy.quality_metrics()
+                        .map_err(|e| LatticeSolverError::BenchmarkFailed(e.to_string()))?,
                     gpu_used: false,
                     precision: PrecisionType::Double,
                 };
@@ -732,13 +705,12 @@ async fn run_benchmark(
     }
     
     // GPU comparison if requested
-    #[cfg(feature = "gpu")]
     if compare_gpu && args.gpu && features::gpu_available() {
         log::info!("Running GPU comparison");
-        let gpu_manager = GPUManager::new(None)?;
-        let gpu_accelerated_operations: &dyn GPUAcceleratedOperations = &gpu_manager;
+        let gpu_accelerated_operations = GPUAcceleratedOperations::new().await
+            .map_err(|e| LatticeSolverError::GpuInitializationFailed(e.to_string()))?;
         
-        run_gpu_benchmark_comparison(gpu_accelerated_operations, &dimensions).await?;
+        run_gpu_benchmark_comparison(&gpu_accelerated_operations, &dimensions).await?;
     }
     
     // Output benchmark results
@@ -882,28 +854,16 @@ fn load_input_lattice(args: &Args) -> Result<Lattice, Box<dyn std::error::Error>
     }
 }
 
-fn save_result(args: &Args, result: &dyn std::any::Any) -> Result<(), Box<dyn std::error::Error>> {
-    // Try to downcast the dynamic result to known result types and serialize
-    let content = if let Some(r) = result.downcast_ref::<LLLResult>() {
-        r.serialize(args.format)?
-    } else if let Some(r) = result.downcast_ref::<BKZResult>() {
-        r.serialize(args.format)?
-    } else if let Some(r) = result.downcast_ref::<SVPResult>() {
-        r.serialize(args.format)?
-    } else if let Some(r) = result.downcast_ref::<CVPResult>() {
-        r.serialize(args.format)?
-    } else {
-        // Fallback: attempt to format using Debug
-        format!("{:?}", result)
-    };
-
-    match &args.output {
-        Some(path) => {
-            log::info!("Saving result to {:?}", path);
+fn save_result(args: &Args, result: &dyn SerializableResult) -> Result<(), Box<dyn std::error::Error>> {
+    match args.output {
+        Some(ref path) => {
+            let content = result.serialize(args.format)?;
             std::fs::write(path, content)
-                .map_err(|e| format!("Failed to write result to {}: {}", path.display(), e).into())
+                .map_err(|e| format!("Failed to write output to {}: {}", path.display(), e).into())
         }
         None => {
+            // Print to stdout
+            let content = result.serialize(args.format)?;
             println!("{}", content);
             Ok(())
         }

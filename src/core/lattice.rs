@@ -828,6 +828,11 @@ impl Lattice {
 
         while let Some(line) = lines.next() {
             let row = Self::parse_row_bigint(line, line_no)?;
+            // Skip empty rows (lines that contained only brackets or whitespace)
+            if row.is_empty() {
+                line_no += 1;
+                continue;
+            }
             if let Some(cols) = expected_cols {
                 if row.len() != cols {
                     return Err(LatticeError::invalid_parameters(format!("Row {} has {} entries, but expected {} columns", line_no, row.len(), cols)));
@@ -858,9 +863,7 @@ impl Lattice {
             let int = Integer::from_str_radix(token, 10).map_err(|e| LatticeError::invalid_parameters(format!("Failed to parse integer on line {} token {}: {}", line_no, i+1, e)))?;
             out.push(int);
         }
-        if out.is_empty() {
-            return Err(LatticeError::invalid_parameters(format!("No numeric data found on line {}", line_no)));
-        }
+        // Return empty vector for lines with no numeric data (allows skipping bracket-only lines)
         Ok(out)
     }
 }

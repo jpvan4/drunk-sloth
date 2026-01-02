@@ -64,7 +64,10 @@ pub use bkz::*;
 pub use svp::*;
 pub use cvp::*;
 pub use precision::PrecisionManager;
+#[cfg(feature = "gpu")]
 pub use gpu::{GPUManager, GPUAcceleratedOperations};
+#[cfg(not(feature = "gpu"))]
+pub use gpu::GPUManager;
 
 // Re-export commonly used types
 pub use core::lattice::Lattice;

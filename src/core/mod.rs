@@ -9,6 +9,9 @@ pub mod bigint_matrix;
 #[cfg(feature = "high-precision")]
 pub mod bigint_lattice;
 
+#[cfg(feature = "high-precision")]
+pub mod integer_lll;
+
 // Re-export the most commonly used items so downstream code can simply import
 // `crate::core::*` without having to juggle individual submodules.
 pub use error::*;
@@ -19,3 +22,6 @@ pub use types::*;
 pub use bigint_matrix::*;
 #[cfg(feature = "high-precision")]
 pub use bigint_lattice::*;
+
+#[cfg(feature = "high-precision")]
+pub use integer_lll::*;

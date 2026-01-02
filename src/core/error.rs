@@ -75,8 +75,6 @@ impl std::fmt::Display for LatticeError {
 }
 
 impl std::error::Error for LatticeError {}
-
-// Convert from rustacuda::error::CudaError to LatticeError for `?` convenience
 // impl From<rustacuda::error::CudaError> for LatticeError {
 //     fn from(e: rustacuda::error::CudaError) -> Self {
 //         LatticeError::gpu_error(format!("CUDA error: {}", e))
@@ -92,6 +90,13 @@ impl From<std::ffi::NulError> for LatticeError {
 impl From<std::io::Error> for LatticeError {
     fn from(e: std::io::Error) -> Self {
         LatticeError::io_error(format!("I/O Error: {}", e))
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<rustacuda::error::CudaError> for LatticeError {
+    fn from(e: rustacuda::error::CudaError) -> Self {
+        LatticeError::gpu_error(format!("CUDA error: {}", e))
     }
 }
 

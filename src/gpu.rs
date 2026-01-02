@@ -31,6 +31,18 @@ pub struct GPUContext {
     pub module: Module,
 }
 
+// Trait grouping all GPU-accelerated operations
+#[cfg(feature = "gpu")]
+pub trait GPUAcceleratedOperations {
+    fn gram_schmidt_gpu(&self, matrix: &Matrix) -> Result<Vec<LatticeVector>>;
+    fn matrix_vector_mult_gpu(&self, matrix: &Matrix, vector: &LatticeVector) -> Result<LatticeVector>;
+    fn lll_gpu(&self, lattice: &Lattice, delta: f64) -> Result<Lattice>;
+    fn accelerated_lll_reduction(&self, lattice: &Lattice) -> Result<Lattice>;
+    fn accelerated_bkz_reduction(&self, lattice: &Lattice) -> Result<Lattice>;
+    fn accelerated_cvp_solve(&self, lattice: &Lattice, target: &LatticeVector) -> Result<crate::cvp::CVPResult>;
+    fn benchmark_gpu_performance(&self, matrix: &Matrix) -> Result<GPUBenchmarkResult>;
+}
+
 #[cfg(feature = "gpu")]
 pub struct GPUManager {
     contexts: Vec<GPUContext>,
@@ -47,7 +59,7 @@ impl GPUManager {
 
         // Load compiled PTX from OUT_DIR if available, otherwise from included file
         let ptx = if let Ok(env_ptx) = std::env::var("KERNELS_PTX") {
-            std::fs::read_to_string(env_ptx).map_err(|e| LatticeError::io_error(format!("Failed to read PTX from {}: {}", env_ptx, e)))?
+            std::fs::read_to_string(&env_ptx).map_err(|e| LatticeError::io_error(format!("Failed to read PTX from {}: {}", env_ptx, e)))?
         } else if let Ok(out) = std::env::var("OUT_DIR") {
             let path = std::path::Path::new(&out).join("kernels.ptx");
             if path.exists() {
@@ -99,9 +111,12 @@ impl GPUManager {
     pub fn device_info(&self) -> String {
         format!("CUDA devices: {}", self.adapter_info.join(", "))
     }
-    
+}
+
+#[cfg(feature = "gpu")]
+impl GPUAcceleratedOperations for GPUManager {
     /// Perform Gram-Schmidt orthogonalization on GPU with f64
-    pub fn gram_schmidt_gpu(&self, matrix: &Matrix) -> Result<Vec<LatticeVector>> {
+    fn gram_schmidt_gpu(&self, matrix: &Matrix) -> Result<Vec<LatticeVector>> {
         let rows = matrix.rows();
         let cols = matrix.cols();
 
@@ -117,7 +132,7 @@ impl GPUManager {
         // Allocate device buffers and copy from host (we may add pinned memory optimization later with LockedBuffer correctly)
         let mut d_matrix = DeviceBuffer::from_slice(&matrix_data)?;
         let mut d_orthogonal = unsafe { DeviceBuffer::zeroed(rows * cols)? };
-        let mut d_norm_sq = unsafe { DeviceBuffer::zeroed(rows)? };
+        let mut d_norm_sq: DeviceBuffer<f64> = unsafe { DeviceBuffer::zeroed(rows)? };
 
         // Launch Gram-Schmidt kernel
         let block_size = 256;
@@ -154,7 +169,7 @@ impl GPUManager {
     }
     
     /// Perform matrix-vector multiplication on GPU with f64
-    pub fn matrix_vector_mult_gpu(&self, matrix: &Matrix, vector: &LatticeVector) -> Result<LatticeVector> {
+    fn matrix_vector_mult_gpu(&self, matrix: &Matrix, vector: &LatticeVector) -> Result<LatticeVector> {
         let rows = matrix.rows();
         let cols = matrix.cols();
 
@@ -176,8 +191,8 @@ impl GPUManager {
 
         // Allocate device buffers
         // Using DeviceBuffer directly here; using LockedBuffer correctly requires element-by-element DeviceCopy and correct size param
-        let d_matrix = DeviceBuffer::from_slice(&matrix_data)?;
-        let d_vector = DeviceBuffer::from_slice(&vec_data)?;
+        let mut d_matrix = DeviceBuffer::from_slice(&matrix_data)?;
+        let mut d_vector = DeviceBuffer::from_slice(&vec_data)?;
         let mut d_result = unsafe { DeviceBuffer::zeroed(rows)? };
 
         // Launch kernel
@@ -206,62 +221,121 @@ impl GPUManager {
     }
     // In gpu.rs, add to GPUManager
 
-    pub fn lll_gpu(&self, lattice: &Lattice, delta: f64) -> Result<Lattice> {
-        log::info("Starting full CUDA LLL kernel");
-    
+    fn lll_gpu(&self, lattice: &Lattice, delta: f64) -> Result<Lattice> {
+        log::info!("Starting iterative CUDA LLL reduction");
+
         let basis = lattice.basis();
-    
         let n = basis.rows();
-    
         let m = basis.cols();
-    
-        if n > 128 {
-            return Err(LatticeError::invalid_parameters("Lattice rank too large for full kernel (max 128)"));
-        }
-    
+
         let matrix_data: Vec<f64> = basis.to_vec().into_iter().flatten().map(|x| x as f64).collect();
-    
+
+        // Use DeviceBuffer for device operations
         let mut d_basis = DeviceBuffer::from_slice(&matrix_data)?;
-    
-        let mut d_orthogonal = DeviceBuffer::zeros(n * m)?;
-    
-        let mut d_mu = DeviceBuffer::zeros(n * n)?;
-    
-        let mut d_B = DeviceBuffer::zeros(n)?;
-    
-        let block_size = 128u32; // Power of 2, >= n
-    
-        let shared_size = block_size as u32 * std::mem::size_of::<f64>() as u32; // For shared memory in reduction
-    
+        let mut d_orthogonal: DeviceBuffer<f64> = unsafe { DeviceBuffer::zeroed(n * m)? };
+        let mut d_mu: DeviceBuffer<f64> = unsafe { DeviceBuffer::zeroed(n * n)? };
+        let mut d_B: DeviceBuffer<f64> = unsafe { DeviceBuffer::zeroed(n)? };
+
         let ctx = &self.contexts[0];
-        let func_name = CString::new("lll_kernel")?;
+
+        // Initial GSO
+        let block_size = 256;
+        let grid_size = n as u32;
+        let shared_size = block_size * std::mem::size_of::<f64>() as u32;
+
+        let func_name = CString::new("lll_gso_kernel")?;
         let func = ctx.module.get_function(func_name.as_c_str())?;
         let stream_ref = &ctx.stream;
         unsafe {
-            launch!(func<<<1, block_size, shared_size, stream_ref>>>(
+            launch!(func<<<grid_size, block_size, shared_size, stream_ref>>>(
                 d_basis.as_device_ptr(),
                 d_orthogonal.as_device_ptr(),
                 d_mu.as_device_ptr(),
                 d_B.as_device_ptr(),
                 n as u32,
-                m as u32,
-                delta
+                m as u32
             ))?;
         }
-    
+
+        // Iterative LLL
+        let mut k = 1;
+        let max_iter = n * n;
+        let mut iter = 0;
+
+        while k < n && iter < max_iter {
+            iter += 1;
+
+            // Size reduction
+            let func_name_sr = CString::new("size_reduce_kernel")?;
+            let func_sr = ctx.module.get_function(func_name_sr.as_c_str())?;
+            unsafe {
+                launch!(func_sr<<<1, block_size, 0, stream_ref>>>(
+                    d_basis.as_device_ptr(),
+                    d_mu.as_device_ptr(),
+                    n as u32,
+                    m as u32,
+                    k as u32,
+                    0.51 // eta
+                ))?;
+            }
+
+            // Update GSO for k
+            // Recompute orthogonal[k], mu[k], B[k]
+            let func_name_gso = CString::new("lll_gso_kernel")?;
+            let func_gso = ctx.module.get_function(func_name_gso.as_c_str())?;
+            unsafe {
+                launch!(func_gso<<<1, block_size, shared_size, stream_ref>>>(
+                    d_basis.as_device_ptr(),
+                    d_orthogonal.as_device_ptr(),
+                    d_mu.as_device_ptr(),
+                    d_B.as_device_ptr(),
+                    (k+1) as u32, // only for i=k
+                    m as u32
+                ))?;
+            }
+
+            // Lovász check and swap
+            let mut d_do_swap: DeviceBuffer<i32> = DeviceBuffer::from_slice(&[0i32])?;
+            let func_name_swap = CString::new("lovasz_swap_kernel")?;
+            let func_swap = ctx.module.get_function(func_name_swap.as_c_str())?;
+            unsafe {
+                launch!(func_swap<<<1, block_size, 0, stream_ref>>>(
+                    d_basis.as_device_ptr(),
+                    d_orthogonal.as_device_ptr(),
+                    d_mu.as_device_ptr(),
+                    d_B.as_device_ptr(),
+                    n as u32,
+                    m as u32,
+                    k as u32,
+                    delta,
+                    d_do_swap.as_device_ptr()
+                ))?;
+            }
+
+            let mut do_swap = [0i32];
+            d_do_swap.copy_to(&mut do_swap)?;
+
+            if do_swap[0] == 1 {
+                if k > 1 {
+                    k -= 1;
+                }
+            } else {
+                k += 1;
+            }
+        }
+
         let mut result_data = vec![0.0f64; n * m];
-    
         d_basis.copy_to(&mut result_data)?;
-    
+
         let data: Vec<Vec<i64>> = (0..n).map(|i| {
             let start = i * m;
             (0..m).map(|j| result_data[start + j].round() as i64).collect()
         }).collect();
-    
+
         Lattice::new(Matrix::new(data)?)
     }
     /// Accelerated lattice reduction using GPU
-    pub fn accelerated_lll_reduction(&self, lattice: &Lattice) -> Result<Lattice> {
+    fn accelerated_lll_reduction(&self, lattice: &Lattice) -> Result<Lattice> {
         log::info!("Starting CUDA GPU-accelerated LLL reduction");
         let basis = lattice.basis();
 
@@ -278,7 +352,7 @@ impl GPUManager {
     }
     
     /// Accelerated BKZ reduction with parallel SVP solving
-    pub fn accelerated_bkz_reduction(&self, lattice: &Lattice) -> Result<Lattice> {
+    fn accelerated_bkz_reduction(&self, lattice: &Lattice) -> Result<Lattice> {
         log::info!("Starting CUDA GPU-accelerated BKZ reduction");
         let basis = lattice.basis();
 
@@ -295,7 +369,7 @@ impl GPUManager {
     }
     
     /// Accelerated CVP solving
-    pub fn accelerated_cvp_solve(
+    fn accelerated_cvp_solve(
         &self,
         lattice: &Lattice,
         target: &LatticeVector,
@@ -316,13 +390,17 @@ impl GPUManager {
     }
     
     /// Benchmark GPU performance
-    pub fn benchmark_gpu_performance(&self, matrix: &Matrix) -> Result<GPUBenchmarkResult> {
+    fn benchmark_gpu_performance(&self, matrix: &Matrix) -> Result<GPUBenchmarkResult> {
         let start = std::time::Instant::now();
         let gpu_result = self.gram_schmidt_gpu(matrix)?;
         let gpu_time = start.elapsed().as_secs_f64();
 
         let start = std::time::Instant::now();
-        let cpu_result = cpu_gram_schmidt_basis(matrix)?;  // Use CPU fallback implemented earlier
+        let vectors: Vec<LatticeVector> = matrix.to_vec().into_iter().map(|row| {
+            let float_row: Vec<f64> = row.into_iter().map(|x| x as f64).collect();
+            LatticeVector::new(float_row)
+        }).collect();
+        let cpu_result = crate::utils::gram_schmidt_process(&vectors)?;
         let cpu_time = start.elapsed().as_secs_f64();
 
         let speedup = cpu_time / gpu_time;
@@ -337,7 +415,6 @@ impl GPUManager {
     }
 }
 
-#[cfg(feature = "gpu")]
 pub struct GPUBenchmarkResult {
     pub gpu_time: f64,
     pub cpu_time: f64,
@@ -345,3 +422,4 @@ pub struct GPUBenchmarkResult {
     pub gpu_result: usize,
     pub cpu_result: usize,
 }
+
